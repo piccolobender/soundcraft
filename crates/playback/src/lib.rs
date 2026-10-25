@@ -171,7 +171,18 @@ struct AudioState {
     /// Retired plugin instances go back to the UI thread to be dropped there.
     garbage: Sender<Vec<Box<dyn Plugin>>>,
     old_sessions: Option<SyncSender<Arc<Session>>>,
+    /// Silent blocks still to run through the plugins while stopped (see `SETTLE_BLOCKS`).
+    settle: u32,
 }
+
+/// Silent blocks the plugins process after a document change while the transport is stopped.
+/// A plugin takes in new parameter values only when it processes: until then its state (what a
+/// session saves) and anything it derives from them lag behind. Auto-Tune Pro, for one, saves a
+/// scale chosen while stopped only once it has processed, so without this a session saved
+/// right away reopens with the old scale.
+const SETTLE_BLOCKS: u32 = 8;
+/// Frames in each of those blocks.
+const SETTLE_FRAMES: usize = 256;
 
 fn new_engine(sr: f32) -> MixEngine {
     let mut m = MixEngine::new(sr, BLOCK);
@@ -202,6 +213,7 @@ impl AudioState {
             device_rate,
             input: None,
             recording: false,
+            settle: 0,
         }
     }
 
@@ -259,6 +271,9 @@ impl AudioState {
             // Place adopted instances now (not only once playback starts), so editors see them;
             // `sync` creates no third-party plugins here.
             self.mix.ensure_synced(&self.session);
+            if !self.playing {
+                self.settle = SETTLE_BLOCKS;
+            }
         }
         self.send_garbage();
         self.shared.playing.store(self.playing, Ordering::Relaxed);
@@ -333,6 +348,13 @@ impl AudioState {
         let channels = channels.max(1);
         let monitoring = self.input.is_some() && self.session.tracks.iter().any(|t| t.mixer.input_monitor || t.mixer.record_arm);
         if !self.playing && !monitoring {
+            if self.settle > 0 {
+                // Let the plugins take in what changed; nothing is heard (see `SETTLE_BLOCKS`).
+                self.settle -= 1;
+                self.render_next(SETTLE_FRAMES);
+                self.pending_len = 0;
+                self.read = 0.0;
+            }
             out.iter_mut().for_each(|x| *x = 0.0);
             if let Ok(mut m) = self.shared.meters.try_lock() {
                 m.main = StripMeter::default();
