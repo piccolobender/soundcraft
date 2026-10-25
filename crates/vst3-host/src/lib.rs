@@ -53,6 +53,8 @@ mod isolate;
 mod plugin;
 #[cfg(not(target_arch = "wasm32"))]
 mod registry;
+#[cfg(not(target_arch = "wasm32"))]
+mod release;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use isolate::SCAN_FLAG;
@@ -146,6 +148,7 @@ mod api {
         registry::plugin_info(id)
     }
     pub fn shutdown() {
+        crate::release::release_all();
         ffi::exit_modules();
     }
 }
@@ -206,6 +209,15 @@ pub fn add_search_dir(dir: &Path) -> usize {
 #[cfg(not(target_arch = "wasm32"))]
 pub fn set_scanner(exe: Option<PathBuf>) {
     isolate::set_scanner(exe)
+}
+
+/// Keeps dropped plugin instances alive for `delay` and then releases them on the main thread
+/// (`None`: release at once, the default). Plugins such as Auto-Tune Pro queue main-thread work
+/// that points at the instance; the app sets a delay so that work runs before the instance goes
+/// (see the `release` module). Needs a main run loop, so headless tools leave it off.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn set_release_delay(delay: Option<std::time::Duration>) {
+    release::set_delay(delay)
 }
 
 /// The child side of [`set_scanner`]: loads one bundle, prints what it holds for the parent and

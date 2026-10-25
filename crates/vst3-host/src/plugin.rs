@@ -3,6 +3,7 @@
 use crate::ffi::{AFTERTOUCH, BusBuffers, EVENT_CAP, EditorLink, HostContext, Instance, NoteEvent, PARAM_QUEUE_CAP, PITCH_BEND};
 use soundcraft_dsp::{Plugin, PluginEditor, PluginInfo, Transport, Unit};
 use std::collections::HashMap;
+use std::mem::ManuallyDrop;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use vst3::ComWrapper;
@@ -28,7 +29,8 @@ enum Mapping {
 /// A hosted VST3 plugin. Parameter ids are VST3 `ParamID`s as decimal strings ("0", "17", …);
 /// values are plain (display) values with their names and ranges in `info().params`.
 pub struct Vst3Plugin {
-    inst: Instance,
+    /// Released through `release::release` (see `Drop`), never dropped in place.
+    inst: ManuallyDrop<Instance>,
     info: &'static PluginInfo,
     /// VST3 id of each `info.params` entry (same order).
     ids: Vec<u32>,
@@ -106,7 +108,7 @@ impl Vst3Plugin {
             transport: None,
             ids,
             maps,
-            inst,
+            inst: ManuallyDrop::new(inst),
         };
         let values: Vec<f32> = (0..p.ids.len())
             .map(|i| {
@@ -194,6 +196,12 @@ fn keep_releases(notes: &mut Vec<NoteEvent>) {
     }
 }
 
+impl Drop for Vst3Plugin {
+    fn drop(&mut self) {
+        crate::release::release(crate::ffi::take_instance(&mut self.inst));
+    }
+}
+
 impl Plugin for Vst3Plugin {
     fn info(&self) -> &'static PluginInfo {
         self.info
@@ -247,7 +255,12 @@ impl Plugin for Vst3Plugin {
             *slot = v;
         }
         let Some(n) = self.normalized_from_plain(i, v) else { return true };
-        if let Some(u) = self.unsynced.get(i) {
+        if crate::ffi::is_main_thread() {
+            // The controller is the plugin's own view of its parameters: its editor shows it,
+            // its state is what a session saves, and some plugins (Auto-Tune Pro's scale) only
+            // act on a change once their controller has it.
+            self.inst.state_link().sync_param(vid, n);
+        } else if let Some(u) = self.unsynced.get(i) {
             u.store(n.to_bits(), Ordering::Relaxed);
         }
         if let Some(e) = self.pending.iter_mut().find(|(pid, _)| *pid == vid) {
@@ -429,6 +442,7 @@ impl Plugin for Vst3Plugin {
             units: self.ids.iter().map(|id| units.remove(id).unwrap_or_default()).collect(),
             ids: self.ids.clone(),
             maps: self.maps.clone(),
+            unsynced: Arc::clone(&self.unsynced),
         }))
     }
 
@@ -459,6 +473,8 @@ struct Vst3Editor {
     units: Vec<String>,
     ids: Vec<u32>,
     maps: Vec<Mapping>,
+    /// The plugin's host-set values its controller has not seen yet (see `Vst3Plugin::unsynced`).
+    unsynced: Arc<[AtomicU64]>,
 }
 
 impl Vst3Editor {
@@ -505,6 +521,14 @@ impl PluginEditor for Vst3Editor {
 
     fn idle(&mut self) -> Vec<(String, f32)> {
         self.link.idle();
+        // Values the host set from the audio thread reach the controller here, on the main
+        // thread, so the plugin's window and its next saved state show them.
+        for (&id, u) in self.ids.iter().zip(self.unsynced.iter()) {
+            let bits = u.swap(SYNCED, Ordering::Relaxed);
+            if bits != SYNCED {
+                self.link.sync_param(id, f64::from_bits(bits));
+            }
+        }
         let mut out = Vec::new();
         for (vid, n) in self.host.take_edits() {
             let Some(i) = self.ids.iter().position(|&x| x == vid) else { continue };

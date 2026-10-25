@@ -283,6 +283,9 @@ fn main() -> eframe::Result {
         }
         Err(e) => log::warn!("plugin scans run in-process: {e}"),
     }
+    // Dropped VST3 instances wait for the run loop to run what they queued (see `set_release_delay`).
+    #[cfg(not(target_arch = "wasm32"))]
+    soundcraft_vst3_host::set_release_delay(Some(std::time::Duration::from_secs(2)));
 
     let engine = if demo { soundcraft_engine::demo::demo_engine() } else { Engine::default() };
     let prefs = load_prefs().unwrap_or_default();

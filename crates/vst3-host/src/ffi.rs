@@ -142,6 +142,11 @@ fn on_main_thread() -> bool {
     std::thread::current().name() == Some("main")
 }
 
+/// Whether this is the main thread (for the plugin wrapper, which may run on the audio thread).
+pub(crate) fn is_main_thread() -> bool {
+    on_main_thread()
+}
+
 /// The OS id of the main thread, recorded when it loads a module (0 until then).
 static MAIN_OS_THREAD: AtomicUsize = AtomicUsize::new(0);
 
@@ -2523,4 +2528,62 @@ mod tests {
         assert!(h.latency_changed.load(Ordering::Relaxed));
         assert_eq!(hex(&[0xAB; 16]), "AB".repeat(16));
     }
+}
+
+// ---- deferred release (see `release`) ------------------------------------------------------
+
+/// Moves the instance out of a `ManuallyDrop` slot, for its owner's `Drop`.
+pub(crate) fn take_instance(slot: &mut std::mem::ManuallyDrop<Instance>) -> Instance {
+    // SAFETY: called once, from the owner's `Drop`, which never touches the slot again.
+    unsafe { std::mem::ManuallyDrop::take(slot) }
+}
+
+/// Work for the main thread's run loop (libdispatch's main queue).
+#[cfg(target_os = "macos")]
+pub(crate) mod main_queue {
+    use std::ffi::c_void;
+    use std::time::Duration;
+
+    #[repr(C)]
+    struct DispatchQueue {
+        _private: [u8; 0],
+    }
+
+    unsafe extern "C" {
+        static _dispatch_main_q: DispatchQueue;
+        fn dispatch_time(when: u64, delta: i64) -> u64;
+        fn dispatch_after_f(when: u64, queue: *const DispatchQueue, context: *mut c_void, work: extern "C" fn(*mut c_void));
+    }
+
+    pub fn available() -> bool {
+        true
+    }
+
+    extern "C" fn trampoline(ctx: *mut c_void) {
+        // SAFETY: `ctx` is the `fn()` pointer `after` passed, cast to a data pointer.
+        let f: fn() = unsafe { std::mem::transmute::<*mut c_void, fn()>(ctx) };
+        f();
+    }
+
+    /// Runs `f` on the main thread's run loop after `delay`.
+    pub fn after(delay: Duration, f: fn()) {
+        let nanos = i64::try_from(delay.as_nanos()).unwrap_or(i64::MAX);
+        // SAFETY: libdispatch's main queue is a static object; `trampoline` and `f` are plain
+        // functions with static lifetime, so the context outlives the call.
+        unsafe {
+            let when = dispatch_time(0, nanos);
+            dispatch_after_f(when, &raw const _dispatch_main_q, f as *const () as *mut c_void, trampoline);
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) mod main_queue {
+    use std::time::Duration;
+
+    pub fn available() -> bool {
+        false
+    }
+
+    pub fn after(_delay: Duration, _f: fn()) {}
 }
